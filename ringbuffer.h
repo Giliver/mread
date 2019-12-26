@@ -4,10 +4,10 @@
 struct ringbuffer;
 
 struct ringbuffer_block {
-	int length;
-	int offset;
-	int id;
-	int next;
+	int length; // block size.
+	int offset;  // write offset.
+	int id; // 绑定的socket id.
+	int next; // 下一个block偏移
 };
 
 struct ringbuffer * ringbuffer_new(int size);

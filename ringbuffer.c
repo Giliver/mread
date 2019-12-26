@@ -9,12 +9,11 @@
 
 struct ringbuffer {
 	int size;
-	int head;
+	int head; // 下次分配位置
 };
 
 static inline int
 block_offset(struct ringbuffer * rb, struct ringbuffer_block * blk) {
-	char * start = (char *)(rb + 1);
 	return (char *)blk - start;
 }
 
@@ -28,6 +27,7 @@ static inline struct ringbuffer_block *
 block_next(struct ringbuffer * rb, struct ringbuffer_block * blk) {
 	int align_length = ALIGN(blk->length);
 	int head = block_offset(rb, blk);
+	// note(yan): why not >=
 	if (align_length + head == rb->size) {
 		return NULL;
 	}
@@ -53,6 +53,7 @@ ringbuffer_delete(struct ringbuffer * rb) {
 
 void
 ringbuffer_link(struct ringbuffer *rb , struct ringbuffer_block * head, struct ringbuffer_block * next) {
+	// todo(yan): 为什么不保持最后一个节点
 	while (head->next >=0) {
 		head = block_ptr(rb, head->next);
 	}
@@ -64,15 +65,21 @@ static struct ringbuffer_block *
 _alloc(struct ringbuffer * rb, int total_size , int size) {
 	struct ringbuffer_block * blk = block_ptr(rb, rb->head);
 	int align_length = ALIGN(sizeof(struct ringbuffer_block) + size);
+	// note(yan): 分配出去的blk.length表示分配大小
+	// 在rb里面的blk.length表示接下来的可以使用的空间大小
 	blk->length = sizeof(struct ringbuffer_block) + size;
 	blk->offset = 0;
 	blk->next = -1;
 	blk->id = -1;
 	struct ringbuffer_block * next = block_next(rb, blk);
+	// note(yan): 调整head位置
 	if (next) {
 		rb->head = block_offset(rb, next);
 		if (align_length < total_size) {
 			next->length = total_size - align_length;
+			// note(yan): length是包括sizeof(struct block)的
+			// 所以如果length小于这个值的话，说明下一个block没有办法被完整分配
+			// 如果大于这个值可能可以被分配，那先将id标记为-1(实际上是没有被分配给socket的)
 			if (next->length >= sizeof(struct ringbuffer_block)) {
 				next->id = -1;
 			}
@@ -91,14 +98,17 @@ ringbuffer_alloc(struct ringbuffer * rb, int size) {
 		int free_size = 0;
 		struct ringbuffer_block * blk = block_ptr(rb, rb->head);
 		do {
+			// note(yan): 回绕回来发现被占用
 			if (blk->length >= sizeof(struct ringbuffer_block) && blk->id >= 0)
 				return NULL;
+			// note(yan): 尝试将多个空闲block串联起来
 			free_size += ALIGN(blk->length);
 			if (free_size >= align_length) {
 				return _alloc(rb, free_size , size);
 			}
 			blk = block_next(rb, blk);
 		} while(blk);
+		// note(yan): 否则就回绕，这次确保肯定能成功，或者是失败
 		rb->head = 0;
 	}
 	return NULL;
@@ -119,6 +129,7 @@ _last_id(struct ringbuffer * rb) {
 	return -1;
 }
 
+// note(yan): 将这个socket id关联的buffer block全部删除
 int
 ringbuffer_collect(struct ringbuffer * rb) {
 	int id = _last_id(rb);
@@ -132,6 +143,7 @@ ringbuffer_collect(struct ringbuffer * rb) {
 	return id;
 }
 
+// note(yan): 前提是blk是最近一个分配的block, 之后的空间是没有被分配的，所以还可以被调整
 void
 ringbuffer_shrink(struct ringbuffer * rb, struct ringbuffer_block * blk, int size) {
 	if (size == 0) {
@@ -161,6 +173,7 @@ _block_id(struct ringbuffer_block * blk) {
 	return id;
 }
 
+// note(yan): blk是通过next字段串联起来的，next是相对rb的偏移
 void
 ringbuffer_free(struct ringbuffer * rb, struct ringbuffer_block * blk) {
 	if (blk == NULL)
@@ -174,6 +187,10 @@ ringbuffer_free(struct ringbuffer * rb, struct ringbuffer_block * blk) {
 	}
 }
 
+// note(yan): 基本上这个函数是想看，跳过skip字节之后，是否可以读取到size字节
+// 如果size字节在block上的话，那么直接返回到ptr上
+// 如果不是需要跨越多个block的话，告诉现在ready了多少字节. max = size
+// 否则返回0表示数据还不够(不足skip字节)
 int
 ringbuffer_data(struct ringbuffer * rb, struct ringbuffer_block * blk, int size, int skip, void **ptr) {
 	int length = blk->length - sizeof(struct ringbuffer_block) - blk->offset;
@@ -182,6 +199,7 @@ ringbuffer_data(struct ringbuffer * rb, struct ringbuffer_block * blk, int size,
 			if (length - skip >= size) {
 				char * start = (char *)(blk + 1);
 				*ptr = (start + blk->offset + skip);
+				// note(yan): 可以读取size字节
 				return size;
 			}
 			*ptr = NULL;
@@ -192,11 +210,13 @@ ringbuffer_data(struct ringbuffer * rb, struct ringbuffer_block * blk, int size,
 				if (ret >= size)
 					return size;
 			}
+			// note(yan): 不能读取size字节，并且只有ret字节
 			return ret;
 		}
 		if (blk->next < 0) {
 			assert(length == skip);
 			*ptr = NULL;
+			// note(yan): 0表示数据还没有ready
 			return 0;
 		}
 		blk = block_ptr(rb, blk->next);
@@ -206,6 +226,7 @@ ringbuffer_data(struct ringbuffer * rb, struct ringbuffer_block * blk, int size,
 	}
 }
 
+// note(yan): 前面函数检测到之后，在ringbuffer上面开辟连续空间，然后copy过来
 void *
 ringbuffer_copy(struct ringbuffer * rb, struct ringbuffer_block * from, int skip, struct ringbuffer_block * to) {
 	int size = to->length - sizeof(struct ringbuffer_block);
@@ -238,6 +259,8 @@ ringbuffer_copy(struct ringbuffer * rb, struct ringbuffer_block * from, int skip
 	}
 }
 
+// note(yan): 接上面函数，如果skip之后数据都放在了一个连续ring block之后，那么skip之前的block
+// 都可以被清除，并且返回清除之后剩下的block.
 struct ringbuffer_block *
 ringbuffer_yield(struct ringbuffer * rb, struct ringbuffer_block *blk, int skip) {
 	int length = blk->length - sizeof(struct ringbuffer_block) - blk->offset;
