@@ -38,10 +38,15 @@
 #define READBLOCKSIZE 2048
 #define RINGBUFFER_DEFAULT 1024 * 1024
 
+// note(yan): 定义这几个socket状态不错
+
 #define SOCKET_INVALID 0
 #define SOCKET_CLOSED 1
+// note(yan): socket处于刚连接上来的状态
 #define SOCKET_SUSPEND 2
 #define SOCKET_READ 3
+// note(yan): socket上出于可读状态
+// 如果需要加入可写状态的话，需要定义SOCKET_READ/WRITE/POLLIN/POLLOUT
 #define SOCKET_POLLIN 4
 
 #define SOCKET_ALIVE	SOCKET_SUSPEND
@@ -49,6 +54,9 @@
 #define LISTENSOCKET (void *)((intptr_t)~0)
 
 struct socket {
+	// note(yan): 可用状态下是系统的fd
+	// 空闲状态下用来做free_socket的链表结构
+	// 因为socket结构都是预先分配出来
 	int fd;
 	struct ringbuffer_block * node;
 	struct ringbuffer_block * temp;
@@ -228,6 +236,7 @@ mread_close(struct mread_pool *self) {
 	free(self);
 }
 
+// note(yan): 从kqueue/epoll里面去要事件处理
 static int
 _read_queue(struct mread_pool * self, int timeout) {
 	self->queue_head = 0;
@@ -316,24 +325,31 @@ _report_closed(struct mread_pool * self) {
 	return -1;
 }
 
+// note(yan): 返回待处理的id. 这个id同时也被写入self->active
 int
 mread_poll(struct mread_pool * self , int timeout) {
 	self->skip = 0;
+	// note(yan): 当前是否有活跃连接需要处理
 	if (self->active >= 0) {
 		struct socket * s = &self->sockets[self->active];
 		if (s->status == SOCKET_READ) {
 			return self->active;
 		}
 	}
+	// note(yan): 处理已经关闭的链接
 	if (self->closed > 0 ) {
 		return _report_closed(self);
 	}
+
+	// note(yan): 如果已经没有事件处理了，从epoll/kqueue里面要事件
 	if (self->queue_head >= self->queue_len) {
 		if (_read_queue(self, timeout) == -1) {
 			self->active = -1;
 			return -1;
 		}
 	}
+
+	// note(yan): 此时事件全部放在queue里面
 	for (;;) {
 		struct socket * s = _read_one(self);
 		if (s == NULL) {
@@ -373,6 +389,7 @@ _link_node(struct ringbuffer * rb, int id, struct socket * s , struct ringbuffer
 	}
 }
 
+// note(yan): 关闭fd, 从epoll/kqueue里面移除，设置状态，然后等poll时被处理
 void
 mread_close_client(struct mread_pool * self, int id) {
 	struct socket * s = &self->sockets[id];
@@ -520,6 +537,7 @@ mread_pull(struct mread_pool * self , int size) {
 	return ret;
 }
 
+// note(yan): 把当前处理链接踢掉。如果当前连接已经处于CLOSED状态放回free_socket.
 void
 mread_yield(struct mread_pool * self) {
 	if (self->active == -1) {
@@ -546,6 +564,12 @@ mread_yield(struct mread_pool * self) {
 	}
 }
 
+// note(yan): 当前self->active节点是否被关闭
+// 在逻辑线程调用mread_close_client
+// 然后在收发线程里面处理CLOSED的socket
+// 1. mread_poll
+// 2. mread_pull (return NULL)
+// 3. mread_closed
 int
 mread_closed(struct mread_pool * self) {
 	if (self->active == -1) {
