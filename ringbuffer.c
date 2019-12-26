@@ -27,7 +27,6 @@ static inline struct ringbuffer_block *
 block_next(struct ringbuffer * rb, struct ringbuffer_block * blk) {
 	int align_length = ALIGN(blk->length);
 	int head = block_offset(rb, blk);
-	// note(yan): why not >=
 	if (align_length + head == rb->size) {
 		return NULL;
 	}
