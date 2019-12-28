@@ -71,12 +71,13 @@ struct mread_pool {
 	int kqueue_fd;
 #endif
 	int max_connection;
-	int closed;
-	int active;
-	int skip;
+	int closed; // note(yan): 当前处于closed状态的连接数
+	int active; // note(yan): 当前活跃的连接id
+	int skip; // note(yan): ??? 这个skip感觉应该和socket相关而不是pool.
 	struct socket * sockets;
 	struct socket * free_socket;
-	int queue_len;
+	// note(yan): event queue.
+	int queue_len; 
 	int queue_head;
 #ifdef HAVE_EPOLL
 	struct epoll_event ev[READQUEUE];
@@ -379,6 +380,7 @@ mread_socket(struct mread_pool * self, int index) {
 	return self->sockets[index].fd;
 }
 
+// note(yan): 将blk挂载到s node的ringblock上
 static void
 _link_node(struct ringbuffer * rb, int id, struct socket * s , struct ringbuffer_block * blk) {
 	if (s->node) {
@@ -410,6 +412,7 @@ mread_close_client(struct mread_pool * self, int id) {
 	++self->closed;
 }
 
+// note(yan): 关闭当前活跃的连接，释放ringblock
 static void
 _close_active(struct mread_pool * self) {
 	int id = self->active;
@@ -477,8 +480,10 @@ mread_pull(struct mread_pool * self , int size) {
 	buffer = (char *)(blk + 1);
 
 	for (;;) {
+		// note(yan): 所以这个不要将socket设置成为non-blocking
 		int bytes = recv(s->fd, buffer, rd, MSG_DONTWAIT);
 		if (bytes > 0) {
+			// note(yan): 之前可能分配多了，所以需要shrink.
 			ringbuffer_shrink(rb, blk , bytes);
 			if (bytes < sz) {
 				_link_node(rb, self->active, s , blk);
@@ -488,6 +493,7 @@ mread_pull(struct mread_pool * self , int size) {
 			s->status = SOCKET_READ;
 			break;
 		}
+		// note(yan): 如果对端关闭了.
 		if (bytes == 0) {
 			ringbuffer_shrink(rb, blk, 0);
 			_close_active(self);
@@ -508,6 +514,9 @@ mread_pull(struct mread_pool * self , int size) {
 			}
 		}
 	}
+	// note(yan): 如果读取的size足够的话，那就返回。但是也要区分是否在一个block内
+	// 如果不在一个block中的话，还需要额外分配内存temp. 额外分配的temp内存也是会被串联起来	
+	// 这样在关闭之后是需要将temp释放掉。
 	_link_node(rb, self->active , s , blk);
 	void * ret;
 	int real_rd = ringbuffer_data(rb, s->node , size , self->skip, &ret);
@@ -537,7 +546,7 @@ mread_pull(struct mread_pool * self , int size) {
 	return ret;
 }
 
-// note(yan): 把当前处理链接踢掉。如果当前连接已经处于CLOSED状态放回free_socket.
+// note(yan): 把当前处理连接切换出去，这样可以把self->skip字节内容释放掉.
 void
 mread_yield(struct mread_pool * self) {
 	if (self->active == -1) {
@@ -569,7 +578,7 @@ mread_yield(struct mread_pool * self) {
 // 然后在收发线程里面处理CLOSED的socket
 // 1. mread_poll
 // 2. mread_pull (return NULL)
-// 3. mread_closed
+// 3. mread_closed 检查是否closed. 如果是closed的话，内部就消化了
 int
 mread_closed(struct mread_pool * self) {
 	if (self->active == -1) {
